@@ -1,0 +1,19 @@
+.DS_Store
+
+# Android Studio / Gradle local files
+.gradle/
+.kotlin/
+.idea/
+build/
+*/build/
+local.properties
+
+# Generated build artifacts
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Local original video downloads.
+# App demo videos live in app/src/main/res/raw/ and are tracked.
+/*.mp4
