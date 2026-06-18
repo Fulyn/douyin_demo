@@ -9,25 +9,33 @@ import android.view.ViewGroup
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.viewpager2.widget.ViewPager2
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 
-class ChannelBarController(
-    private val scrollView: HorizontalScrollView,
-    private val row: LinearLayout,
-    private val indicator: View,
-    private val onChannelClick: (Int) -> Unit
+class ChannelBar(
+    rootView: View,
+    channels: List<Channel>,
+    selectedIndex: Int,
+    private val channelPagerView: ViewPager2
 ) {
 
+    private val scrollView: HorizontalScrollView = rootView.findViewById(R.id.channelScrollView)
+    private val rowForText: LinearLayout = rootView.findViewById(R.id.rowForText)
+    private val indicator: View = rootView.findViewById(R.id.channelIndicator)
     private val channelTextViews = mutableListOf<TextView>()
 
-    fun bind(channels: List<Channel>, selectedIndex: Int) {
-        row.removeAllViews()
+    init {
+        bind(channels, selectedIndex)
+    }
+
+    private fun bind(channels: List<Channel>, selectedIndex: Int) {
+        rowForText.removeAllViews()
         channelTextViews.clear()
 
         channels.forEachIndexed { index, channel ->
-            val channelTextView = TextView(row.context).apply {
+            val channelTextView = TextView(rowForText.context).apply {
                 text = channel.title
                 gravity = Gravity.CENTER
                 typeface = Typeface.DEFAULT_BOLD
@@ -39,15 +47,15 @@ class ChannelBarController(
                     ViewGroup.LayoutParams.MATCH_PARENT
                 )
                 setOnClickListener {
-                    onChannelClick(index)
+                    channelPagerView.setCurrentItem(index, false)
                 }
             }
 
             channelTextViews.add(channelTextView)
-            row.addView(channelTextView)
+            rowForText.addView(channelTextView)
         }
 
-        row.post {
+        rowForText.post {
             update(selectedIndex, 0f)
         }
     }
@@ -64,11 +72,6 @@ class ChannelBarController(
         }
 
         updateIndicatorPosition(startIndex, endIndex, positionOffset)
-    }
-
-    fun clear() {
-        row.removeAllViews()
-        channelTextViews.clear()
     }
 
     private fun updateIndicatorPosition(startIndex: Int, endIndex: Int, positionOffset: Float) {
@@ -97,7 +100,7 @@ class ChannelBarController(
 
     private fun scrollXForCenteredIndicator(indicatorCenterX: Float): Int {
         val viewportWidth = scrollView.width - scrollView.paddingStart - scrollView.paddingEnd
-        val maxScrollX = max(0, row.width - viewportWidth)
+        val maxScrollX = max(0, rowForText.width - viewportWidth)
         val desiredScrollX = indicatorCenterX - viewportWidth / 2f
 
         return desiredScrollX.roundToInt().coerceIn(0, maxScrollX)
@@ -112,7 +115,7 @@ class ChannelBarController(
     }
 
     private fun dp(value: Int): Int {
-        return (value * row.resources.displayMetrics.density).roundToInt()
+        return (value * rowForText.resources.displayMetrics.density).roundToInt()
     }
 
     private companion object {
