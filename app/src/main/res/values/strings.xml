@@ -21,8 +21,5 @@
     <string name="channel_following">关注</string>
     <string name="channel_local">同城</string>
     <string name="channel_recommended">推荐</string>
-    <string name="channel_page_title">%1$s频道</string>
-    <string name="video_number">第 %1$d / %2$d 条</string>
-    <string name="video_hint">上下滑动视频，左右滑动频道</string>
     <string name="video_meta">%1$s  ·  %2$s</string>
 </resources>

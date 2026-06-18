@@ -17,3 +17,4 @@ local.properties
 # Local original video downloads.
 # App demo videos live in app/src/main/res/raw/ and are tracked.
 /*.mp4
+/视频/
