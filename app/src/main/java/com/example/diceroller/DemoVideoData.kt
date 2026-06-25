@@ -4,7 +4,8 @@ import android.content.Context
 
 data class Channel(
     val title: String,
-    val videoItems: List<VideoItem>
+    val videoItems: List<VideoItem>,
+    val isLiveChannel: Boolean = false
 )
 
 data class VideoItem(
@@ -12,8 +13,7 @@ data class VideoItem(
     val author: String,
     val stats: String,
     val videoResId: Int,
-    val coverResId: Int,
-    val isLiveCard: Boolean = false
+    val coverResId: Int
 )
 
 object DemoVideoData {
@@ -53,7 +53,8 @@ object DemoVideoData {
                     VideoItem("安详", "@live_room", "2.1w likes  ·  1,032 comments", R.raw.live_peaceful, R.drawable.live_peaceful_cover),
                     VideoItem("iPhone 手机", "@maker_live", "9,405 likes  ·  642 comments", R.raw.live_iphone, R.drawable.live_iphone_cover),
                     VideoItem("成语接龙", "@game_live", "4.8w likes  ·  3,215 comments", R.raw.live_idiom_game, R.drawable.live_idiom_game_cover)
-                )
+                ),
+                isLiveChannel = true
             ),
             Channel(
                 context.getString(R.string.channel_following),
@@ -80,5 +81,9 @@ object DemoVideoData {
                 )
             )
         )
+    }
+
+    fun createLiveChannel(context: Context): Channel {
+        return createChannels(context).first { it.isLiveChannel }
     }
 }

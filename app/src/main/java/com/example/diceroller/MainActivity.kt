@@ -16,6 +16,7 @@
 package com.example.diceroller
 
 import android.os.Bundle
+import android.view.ViewGroup
 import android.view.View
 import androidx.appcompat.app.AppCompatActivity
 import androidx.fragment.app.Fragment
@@ -33,6 +34,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        VideoController.init(this)
         setContentView(R.layout.activity_main)
 
         if (savedInstanceState == null) {
@@ -41,6 +43,26 @@ class MainActivity : AppCompatActivity() {
                 .commit()
         }
     }
+
+    fun openLiveRoom(startPosition: Int) {
+        VideoController.shared.pauseCurrentVideo()
+        supportFragmentManager.beginTransaction()
+            .add(R.id.fragmentContainer, LiveRoomFragment.newInstance(startPosition))
+            .addToBackStack(LiveRoomFragment.BACK_STACK_NAME)
+            .commit()
+    }
+
+    fun restoreHomeVideoSource() {
+        supportFragmentManager.fragments
+            .filterIsInstance<HomeFragment>()
+            .firstOrNull()
+            ?.playCurrentVideo()
+    }
+
+    override fun onDestroy() {
+        VideoController.shared.destroy()
+        super.onDestroy()
+    }
 }
 
 @UnstableApi
@@ -48,7 +70,6 @@ class HomeFragment : Fragment(R.layout.fragment_home) {
 
     private lateinit var channelPager: ChannelPager
     private lateinit var channelBar: ChannelBar
-    private lateinit var videoController: VideoController
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
@@ -57,12 +78,7 @@ class HomeFragment : Fragment(R.layout.fragment_home) {
         val initialChannelIndex = channels.lastIndex
 
         val channelPagerView = view.findViewById<ViewPager2>(R.id.channelPager)
-        videoController = VideoController(
-            context = requireContext(),
-            resources = resources,
-            currentVideoProvider = { channelPager.currentVideo() },
-            boundVideosProvider = { channelPager.boundVideos() }
-        )
+        val hostActivity = requireActivity() as MainActivity
         channelBar = ChannelBar(
             rootView = view,
             channels = channels,
@@ -74,25 +90,99 @@ class HomeFragment : Fragment(R.layout.fragment_home) {
             pager = channelPagerView,
             channels = channels,
             selectedIndex = initialChannelIndex,
-            videoController = videoController,
-            channelBar = channelBar
+            channelBar = channelBar,
+            onEnterLiveRoom = { _, startPosition ->
+                hostActivity.openLiveRoom(startPosition)
+            }
         )
+        // 起播统一放在 onStart：它在首次创建时也必然紧跟 onViewCreated 触发，
+        // 还能覆盖从后台返回的恢复。这里不再额外调一次，避免对同一条视频连播两遍 play。
     }
 
     override fun onStart() {
         super.onStart()
-        channelPager.playCurrentVideo()
+        playCurrentVideo()
     }
 
     override fun onStop() {
-        videoController.pauseCurrentVideo()
+        VideoController.shared.pauseCurrentVideo()
         super.onStop()
     }
 
     override fun onDestroyView() {
         channelPager.release()
-        videoController.release()
 
         super.onDestroyView()
+    }
+
+    fun playCurrentVideo() {
+        channelPager.playCurrentVideo()
+    }
+}
+
+@UnstableApi
+class LiveRoomFragment : Fragment() {
+
+    private lateinit var livePager: LivePager
+
+    override fun onCreateView(
+        inflater: android.view.LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        return ViewPager2(requireContext()).apply {
+            id = View.generateViewId()
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+            setBackgroundResource(R.color.video_background)
+        }
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+
+        val liveChannel = DemoVideoData.createLiveChannel(requireContext())
+        livePager = LivePager(
+            pager = view as ViewPager2,
+            videoItems = liveChannel.videoItems,
+            showEnterButton = false,
+            selectedItemIndex = requireArguments().getInt(ARG_START_POSITION)
+        )
+        // 同 HomeFragment：起播交给 onStart，onViewCreated 不再重复调。
+    }
+
+    override fun onStart() {
+        super.onStart()
+        playCurrentVideo()
+    }
+
+    override fun onStop() {
+        VideoController.shared.pauseCurrentVideo()
+        super.onStop()
+    }
+
+    override fun onDestroyView() {
+        livePager.release()
+        (requireActivity() as MainActivity).restoreHomeVideoSource()
+        super.onDestroyView()
+    }
+
+    private fun playCurrentVideo() {
+        livePager.playCurrentVideo()
+    }
+
+    companion object {
+        const val BACK_STACK_NAME = "live_room"
+        private const val ARG_START_POSITION = "start_position"
+
+        fun newInstance(startPosition: Int): LiveRoomFragment {
+            return LiveRoomFragment().apply {
+                arguments = Bundle().apply {
+                    putInt(ARG_START_POSITION, startPosition)
+                }
+            }
+        }
     }
 }

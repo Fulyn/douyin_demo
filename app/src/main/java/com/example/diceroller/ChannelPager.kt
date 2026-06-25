@@ -2,6 +2,7 @@ package com.example.diceroller
 
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import androidx.media3.common.util.UnstableApi
 import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.widget.ViewPager2
@@ -9,27 +10,15 @@ import androidx.viewpager2.widget.ViewPager2
 @UnstableApi
 class ChannelPager(
     private val pager: ViewPager2,
-    channels: List<Channel>,
+    private val channels: List<Channel>,
     selectedIndex: Int,
-    private val videoController: VideoController,
-    private val channelBar: ChannelBar
+    private val channelBar: ChannelBar,
+    private val onEnterLiveRoom: (liveItems: List<VideoItem>, startPosition: Int) -> Unit
 ) {
 
-    private val channelAdapter = ChannelPagerAdapter(
-        channels = channels,
-        videoController = videoController,
-        onVideoSelected = { channelPosition ->
-            if (channelPosition == pager.currentItem) {
-                playCurrentVideo()
-            }
-        }
-    )
+    private val channelAdapter = ChannelPagerAdapter()
     private val pageChangeCallback = object : ViewPager2.OnPageChangeCallback() {
-        override fun onPageScrolled(
-            position: Int,
-            positionOffset: Float,
-            positionOffsetPixels: Int
-        ) {
+        override fun onPageScrolled(position: Int, positionOffset: Float, positionOffsetPixels: Int) {
             channelBar.update(position, positionOffset)
         }
 
@@ -47,124 +36,95 @@ class ChannelPager(
         pager.registerOnPageChangeCallback(pageChangeCallback)
     }
 
-    fun currentVideo(): VideoInterface? {
-        val channelHolder = channelAdapter.boundHolders[pager.currentItem] ?: return null
-        val videoPager = channelHolder.videoPager ?: return null
-
-        return videoPager.videoAdapter.boundHolders[videoPager.pager.currentItem]
-    }
-
-    fun boundVideos(): List<VideoInterface> {
-        return channelAdapter.boundHolders.values.flatMap { channelHolder ->
-            channelHolder.videoPager?.videoAdapter?.boundHolders?.values.orEmpty()
-        }
-    }
-
+    // 横向频道父级只负责把"播放当前频道的视频"委托下去，自身从不自动横滑切频道。
     fun playCurrentVideo() {
         pager.post {
-            videoController.playCurrentVideo()
+            channelAdapter.boundHolders[pager.currentItem]?.playCurrentVideo()
         }
     }
 
     fun release() {
-        channelAdapter.boundHolders.values.forEach { channelHolder ->
-            val videoPager = channelHolder.videoPager ?: return@forEach
-
-            videoPager.videoAdapter.boundHolders.values.forEach { videoHolder ->
-                videoController.detachFrom(videoHolder)
-                videoHolder.clearCover()
-                videoHolder.resetControlUi()
-            }
-            videoPager.videoAdapter.boundHolders.clear()
-            videoPager.pager.adapter = null
-        }
-        channelAdapter.boundHolders.clear()
+        channelAdapter.boundHolders.values.forEach { it.releasePage() }
+        // adapter（inner 类，持有外层 ChannelPager 引用）随 adapter = null 失去引用，
+        // 它和 boundHolders 一并交给 GC，无需手动 clear。
         pager.adapter = null
     }
-}
 
-@UnstableApi
-private class ChannelPagerAdapter(
-    private val channels: List<Channel>,
-    private val videoController: VideoController,
-    private val onVideoSelected: (channelPosition: Int) -> Unit
-) : RecyclerView.Adapter<ChannelViewHolder>() {
+    // adapter / holder 设为 inner：频道列表、进直播间回调、横向 pager 等都直接读外层，
+    // 不必再当成构造参数层层传递。
+    private inner class ChannelPagerAdapter : RecyclerView.Adapter<ChannelViewHolder>() {
 
-    val boundHolders = mutableMapOf<Int, ChannelViewHolder>()
+        val boundHolders = mutableMapOf<Int, ChannelViewHolder>()
 
-    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ChannelViewHolder {
-        val videoPagerView = ViewPager2(parent.context).apply {
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ChannelViewHolder {
+            return ChannelViewHolder(parent)
+        }
+
+        override fun onBindViewHolder(holder: ChannelViewHolder, position: Int) {
+            boundHolders.entries.removeAll { it.value == holder }
+            boundHolders[position] = holder
+            holder.bind(channels[position], position)
+        }
+
+        override fun getItemCount(): Int = channels.size
+
+        override fun onViewRecycled(holder: ChannelViewHolder) {
+            val position = boundHolders.entries.find { it.value == holder }?.key
+            if (position != null) {
+                boundHolders.remove(position)
+            }
+            holder.releasePage()
+        }
+    }
+
+    private inner class ChannelViewHolder(
+        parent: ViewGroup
+    ) : RecyclerView.ViewHolder(
+        ViewPager2(parent.context).apply {
             id = View.generateViewId()
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
+            layoutParams = ViewGroup.LayoutParams(MATCH_PARENT, MATCH_PARENT)
             orientation = ViewPager2.ORIENTATION_VERTICAL
             offscreenPageLimit = 1
             overScrollMode = View.OVER_SCROLL_NEVER
         }
+    ) {
 
-        return ChannelViewHolder(videoPagerView, videoController, onVideoSelected)
-    }
+        private val videoPagerView = itemView as ViewPager2
+        private var videoPager: VideoPager? = null
+        private var livePager: LivePager? = null
 
-    override fun onBindViewHolder(holder: ChannelViewHolder, position: Int) {
-        boundHolders.entries.removeAll { it.value == holder }
-        boundHolders[position] = holder
-        holder.bind(channels[position], position)
-    }
-
-    override fun getItemCount(): Int {
-        return channels.size
-    }
-
-    override fun onViewRecycled(holder: ChannelViewHolder) {
-        val position = boundHolders.entries.find { it.value == holder }?.key
-        if (position != null) {
-            boundHolders.remove(position)
+        // 把"播放当前视频"委托给本频道实际的竖向 pager；自动续播下一条由它自己负责。
+        fun playCurrentVideo() {
+            videoPager?.playCurrentVideo() ?: livePager?.playCurrentVideo()
         }
-        val videoPager = holder.videoPager
-        if (videoPager != null) {
-            videoPager.pager.unregisterOnPageChangeCallback(videoPager.videoChangeCallback)
-            videoPager.videoAdapter.boundHolders.values.forEach { videoHolder ->
-                videoController.detachFrom(videoHolder)
-                videoHolder.clearCover()
-                videoHolder.resetControlUi()
+
+        fun bind(channel: Channel, position: Int) {
+            releasePage()
+
+            if (channel.isLiveChannel) {
+                livePager = LivePager(
+                    pager = videoPagerView,
+                    videoItems = channel.videoItems,
+                    showEnterButton = true,
+                    onEnterLiveRoom = { startPosition -> onEnterLiveRoom(channel.videoItems, startPosition) }
+                )
+                return
             }
-            videoPager.videoAdapter.boundHolders.clear()
-            videoPager.pager.adapter = null
+
+            videoPager = VideoPager(
+                pager = videoPagerView,
+                channel = channel,
+                // 是否正是当前可见频道：竖向换页时 VideoPager 自己据此决定要不要起播，
+                // 不必再绕回 ChannelPager 兜一圈又委托回同一个 VideoPager。
+                isActiveChannel = { position == pager.currentItem }
+            )
         }
-        holder.videoPager = null
-        super.onViewRecycled(holder)
-    }
-}
 
-@UnstableApi
-private class ChannelViewHolder(
-    private val videoPagerView: ViewPager2,
-    private val videoController: VideoController,
-    private val onVideoSelected: (channelPosition: Int) -> Unit
-) : RecyclerView.ViewHolder(videoPagerView) {
-
-    var videoPager: VideoPager? = null
-
-    fun bind(channel: Channel, position: Int) {
-        val oldVideoPager = videoPager
-        if (oldVideoPager != null) {
-            oldVideoPager.pager.unregisterOnPageChangeCallback(oldVideoPager.videoChangeCallback)
-            oldVideoPager.videoAdapter.boundHolders.values.forEach { videoHolder ->
-                videoController.detachFrom(videoHolder)
-                videoHolder.clearCover()
-                videoHolder.resetControlUi()
-            }
-            oldVideoPager.videoAdapter.boundHolders.clear()
-            oldVideoPager.pager.adapter = null
+        fun releasePage() {
+            videoPager?.release()
+            livePager?.release()
+            videoPager = null
+            livePager = null
         }
-        videoPager = VideoPager(
-            pager = videoPagerView,
-            channel = channel,
-            channelPosition = position,
-            videoController = videoController,
-            onVideoSelected = onVideoSelected
-        )
     }
 }

@@ -22,4 +22,5 @@
     <string name="channel_local">同城</string>
     <string name="channel_recommended">推荐</string>
     <string name="video_meta">%1$s  ·  %2$s</string>
+    <string name="live_enter_room">点击进入直播间</string>
 </resources>
