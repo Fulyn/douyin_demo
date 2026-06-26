@@ -5,6 +5,7 @@ import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.TextView
@@ -17,7 +18,12 @@ import androidx.viewpager2.widget.ViewPager2
 class VideoPager(
     internal val pager: ViewPager2,
     private val channel: Channel,
-    private val isActiveChannel: () -> Boolean
+    private val isActiveChannel: () -> Boolean,
+    private val selectedItemIndex: Int = 0,
+    // 仅直播频道用：true=直播间内（纯视频），false=直播间外（预览页，带标题/简介/进入按钮）。
+    private val isInsideLiveRoom: Boolean = false,
+    // 直播间外（预览页）点"进入"时回调；直播间内为空。
+    private val onEnterLiveRoom: ((startPosition: Int) -> Unit)? = null
 ) {
 
     private val videoAdapter = VideoPagerAdapter()
@@ -29,8 +35,12 @@ class VideoPager(
     }
 
     init {
+        // 自配置竖向滑动，使 VideoPager 既能内嵌频道页、也能独立用在直播间页面。
+        pager.orientation = ViewPager2.ORIENTATION_VERTICAL
+        pager.offscreenPageLimit = 1
+        pager.overScrollMode = View.OVER_SCROLL_NEVER
         pager.adapter = videoAdapter
-        pager.setCurrentItem(loopStartPosition(channel.videoItems.size), false)
+        pager.setCurrentItem(loopStartPosition(channel.videoItems.size, selectedItemIndex), false)
         pager.registerOnPageChangeCallback(videoChangeCallback)
     }
 
@@ -54,29 +64,41 @@ class VideoPager(
     }
 
     // adapter 设为 inner：频道数据直接读外层 channel，不必当成构造参数传入。
-    private inner class VideoPagerAdapter : RecyclerView.Adapter<VideoViewHolder>() {
+    // 普通频道用 VideoViewHolder（含进度/暂停控件），直播频道用 LiveViewHolder（含进入按钮）。
+    private inner class VideoPagerAdapter : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
 
-        val boundHolders = mutableMapOf<Int, VideoViewHolder>()
+        val boundHolders = mutableMapOf<Int, VideoInterface>()
 
-        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VideoViewHolder {
-            return VideoViewHolder(parent)
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
+            return if (channel.isLiveChannel) {
+                LiveViewHolder(parent, isInsideLiveRoom, onEnterLiveRoom)
+            } else {
+                VideoViewHolder(parent)
+            }
         }
 
-        override fun onBindViewHolder(holder: VideoViewHolder, position: Int) {
-            boundHolders.entries.removeAll { it.value == holder }
-            boundHolders[position] = holder
-            holder.bind(channel.videoItems[position % channel.videoItems.size])
+        override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
+            boundHolders.entries.removeAll { it.value === holder }
+            boundHolders[position] = holder as VideoInterface
+
+            val realIndex = position % channel.videoItems.size
+            val item = channel.videoItems[realIndex]
+            when (holder) {
+                is VideoViewHolder -> holder.bind(item)
+                is LiveViewHolder -> holder.bind(item, realIndex)
+            }
         }
 
         override fun getItemCount(): Int {
             return if (channel.videoItems.size <= 1) channel.videoItems.size else LOOP_ITEM_COUNT
         }
 
-        override fun onViewRecycled(holder: VideoViewHolder) {
-            val position = boundHolders.entries.find { it.value == holder }?.key ?: return
+        override fun onViewRecycled(holder: RecyclerView.ViewHolder) {
+            val video = holder as VideoInterface
+            val position = boundHolders.entries.find { it.value === video }?.key ?: return
             boundHolders.remove(position)
-            VideoController.shared.detachFrom(holder)
-            holder.recycleUi()
+            VideoController.shared.detachFrom(video)
+            video.recycleUi()
         }
     }
 }
@@ -86,7 +108,7 @@ internal class VideoViewHolder(
     parent: ViewGroup
 ) : RecyclerView.ViewHolder(
     LayoutInflater.from(parent.context).inflate(R.layout.view_video_item, parent, false)
-), VideoInterface {
+), VideoControls {
 
     override val playerView: PlayerView = itemView.findViewById(R.id.video_player_view)
     private val coverImageView: ImageView = itemView.findViewById(R.id.video_cover)
@@ -103,6 +125,8 @@ internal class VideoViewHolder(
         private set
 
     private var isPausedUiVisible = false
+    // 暂停图标在 XML 里设的静止透明度，作为弹出动画的目标值（避免硬编码 0.72）。
+    private val pausedIconAlpha = pauseIconView.alpha
     private var progressDragStartX = 0f
     private var progressDragStartValue = 0f
     private val hideProgressRunnable = Runnable {
@@ -149,12 +173,13 @@ internal class VideoViewHolder(
 
     override fun setPausedUiVisible(visible: Boolean) {
         isPausedUiVisible = visible
-        pauseIconView.visibility = if (visible) View.VISIBLE else View.GONE
 
         if (visible) {
+            animatePauseIconIn()
             progressTrack.removeCallbacks(hideProgressRunnable)
             setProgressUiVisible(true)
         } else {
+            animatePauseIconOut()
             hideProgressLater()
         }
     }
@@ -167,8 +192,40 @@ internal class VideoViewHolder(
         isDraggingProgress = false
         isPausedUiVisible = false
         progressTrack.removeCallbacks(hideProgressRunnable)
+        // 切换视频/回收：立即隐藏，不要动画（否则换页会看到残留的暂停图标淡出）。
+        pauseIconView.animate().cancel()
         pauseIconView.visibility = View.GONE
         setProgressUiVisible(false)
+    }
+
+    // 播放 → 暂停：图标从放大态缩回原大小，同时透明度 0 → 静止透明度，形成"弹出"。
+    private fun animatePauseIconIn() {
+        pauseIconView.animate().cancel()
+        pauseIconView.apply {
+            visibility = View.VISIBLE
+            alpha = 0f
+            scaleX = PAUSE_ICON_POP_SCALE
+            scaleY = PAUSE_ICON_POP_SCALE
+            animate()
+                .alpha(pausedIconAlpha)
+                .scaleX(1f)
+                .scaleY(1f)
+                .setDuration(PAUSE_ICON_SHOW_MS)
+                .setInterpolator(DecelerateInterpolator())
+                .start()
+        }
+    }
+
+    // 暂停 → 播放：仅渐出。图标本就不可见时（首播、后台恢复等）直接跳过，无动画。
+    private fun animatePauseIconOut() {
+        if (pauseIconView.visibility != View.VISIBLE) return
+
+        pauseIconView.animate().cancel()
+        pauseIconView.animate()
+            .alpha(0f)
+            .setDuration(PAUSE_ICON_HIDE_MS)
+            .withEndAction { pauseIconView.visibility = View.GONE }
+            .start()
     }
 
     // ---------------- 进度条拖动 ----------------
@@ -220,4 +277,63 @@ internal class VideoViewHolder(
     }
 }
 
+// 直播频道的页：复用共享播放器与封面机制，但没有进度/暂停控件（故只实现 VideoInterface）。
+// isInsideLiveRoom 区分两套 UI：true=直播间内（纯视频）；false=直播间外（预览浮层：标题/简介/进入按钮）。
+@UnstableApi
+internal class LiveViewHolder(
+    parent: ViewGroup,
+    private val isInsideLiveRoom: Boolean,
+    private val onEnterLiveRoom: ((startPosition: Int) -> Unit)?
+) : RecyclerView.ViewHolder(
+    LayoutInflater.from(parent.context).inflate(R.layout.view_live_item, parent, false)
+), VideoInterface {
+
+    override val playerView: PlayerView = itemView.findViewById(R.id.video_player_view)
+    private val coverImageView: ImageView = itemView.findViewById(R.id.live_cover)
+    private val previewOverlay: View = itemView.findViewById(R.id.live_preview_overlay)
+    private val titleText: TextView = itemView.findViewById(R.id.live_title)
+    private val metaText: TextView = itemView.findViewById(R.id.live_meta)
+    private val enterButton: TextView = itemView.findViewById(R.id.live_enter_button)
+
+    override var videoItem: VideoItem? = null
+        private set
+    private var itemIndex = 0
+
+    init {
+        // 直播间内整组预览浮层隐藏，只留视频；外（预览）才显示。
+        previewOverlay.visibility = if (isInsideLiveRoom) View.GONE else View.VISIBLE
+        enterButton.setOnClickListener { onEnterLiveRoom?.invoke(itemIndex) }
+    }
+
+    fun bind(videoItem: VideoItem, position: Int) {
+        val cover = VideoController.shared.coverFor(videoItem)
+
+        this.videoItem = videoItem
+        itemIndex = position
+
+        // 被绑定的页一定不是当前播放页（当前页不会被回收重绑），所以直接摘掉播放器、盖上封面占位。
+        playerView.player = null
+        setCover(cover, showCover = cover != null)
+
+        titleText.text = videoItem.title
+        metaText.text = itemView.context.getString(R.string.video_meta, videoItem.author, videoItem.stats)
+    }
+
+    override fun setCover(bitmap: Bitmap?, showCover: Boolean) {
+        coverImageView.setImageBitmap(bitmap)
+        coverImageView.visibility = if (showCover) View.VISIBLE else View.GONE
+    }
+
+    override fun hideCover() {
+        coverImageView.visibility = View.GONE
+    }
+
+    override fun clearCover() = setCover(bitmap = null, showCover = false)
+}
+
 private const val PROGRESS_HIDE_DELAY_MS = 1_500L
+
+// 暂停图标弹出动画：起始放大倍数 + 弹出/渐出时长。
+private const val PAUSE_ICON_POP_SCALE = 2.5f
+private const val PAUSE_ICON_SHOW_MS = 220L
+private const val PAUSE_ICON_HIDE_MS = 150L

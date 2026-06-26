@@ -13,7 +13,7 @@ class ChannelPager(
     private val channels: List<Channel>,
     selectedIndex: Int,
     private val channelBar: ChannelBar,
-    private val onEnterLiveRoom: (liveItems: List<VideoItem>, startPosition: Int) -> Unit
+    private val onEnterLiveRoom: (startPosition: Int) -> Unit
 ) {
 
     private val channelAdapter = ChannelPagerAdapter()
@@ -91,40 +91,29 @@ class ChannelPager(
 
         private val videoPagerView = itemView as ViewPager2
         private var videoPager: VideoPager? = null
-        private var livePager: LivePager? = null
 
-        // 把"播放当前视频"委托给本频道实际的竖向 pager；自动续播下一条由它自己负责。
+        // 把"播放当前视频"委托给本频道的竖向 pager；自动续播下一条由它自己负责。
         fun playCurrentVideo() {
-            videoPager?.playCurrentVideo() ?: livePager?.playCurrentVideo()
+            videoPager?.playCurrentVideo()
         }
 
         fun bind(channel: Channel, position: Int) {
             releasePage()
-
-            if (channel.isLiveChannel) {
-                livePager = LivePager(
-                    pager = videoPagerView,
-                    videoItems = channel.videoItems,
-                    showEnterButton = true,
-                    onEnterLiveRoom = { startPosition -> onEnterLiveRoom(channel.videoItems, startPosition) }
-                )
-                return
-            }
 
             videoPager = VideoPager(
                 pager = videoPagerView,
                 channel = channel,
                 // 是否正是当前可见频道：竖向换页时 VideoPager 自己据此决定要不要起播，
                 // 不必再绕回 ChannelPager 兜一圈又委托回同一个 VideoPager。
-                isActiveChannel = { position == pager.currentItem }
+                isActiveChannel = { position == pager.currentItem },
+                // 仅直播频道（预览页）需要进入按钮回调；普通频道传 null。
+                onEnterLiveRoom = if (channel.isLiveChannel) onEnterLiveRoom else null
             )
         }
 
         fun releasePage() {
             videoPager?.release()
-            livePager?.release()
             videoPager = null
-            livePager = null
         }
     }
 }

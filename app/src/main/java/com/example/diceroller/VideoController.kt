@@ -15,22 +15,33 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 
+// 所有视频页（普通视频页 + 直播页）的共同能力：承载共享播放器 + 封面占位。
+// 进度条/暂停这类只有普通视频才有的控件不放这里，见 VideoControls。
 interface VideoInterface {
     val videoItem: VideoItem?
     val videoResId: Int?
         get() = videoItem?.videoResId
-    val isDraggingProgress: Boolean
     val playerView: PlayerView
 
     fun setCover(bitmap: Bitmap?, showCover: Boolean)
     fun hideCover()
     fun clearCover()
+
+    // 视图层自清理：清掉封面位图引用（普通视频页会扩展它再复位控件，见 VideoControls）。
+    fun recycleUi() {
+        clearCover()
+    }
+}
+
+// 普通视频页特有：进度条 + 暂停控件。直播页没有这些，故单独拆出，
+// 避免直播 holder 被迫写一堆空实现。VideoController 用 as? VideoControls 按需调用。
+interface VideoControls : VideoInterface {
+    val isDraggingProgress: Boolean
     fun setPausedUiVisible(visible: Boolean)
     fun updateProgressUi(progress: Float)
     fun resetControlUi()
 
-    // 视图层自清理：清掉封面位图引用并复位播放控件。
-    fun recycleUi() {
+    override fun recycleUi() {
         clearCover()
         resetControlUi()
     }
@@ -84,7 +95,7 @@ class VideoController private constructor(
             isManuallyPaused = true
             pauseSharedPlayer()
             updateCurrentProgressUi()
-            video.setPausedUiVisible(true)
+            (video as? VideoControls)?.setPausedUiVisible(true)
         }
     }
 
@@ -95,7 +106,7 @@ class VideoController private constructor(
 
         val targetPosition = (duration * progress.coerceIn(0f, 1f)).toLong()
         player.seekTo(targetPosition)
-        currentVideo?.updateProgressUi(progress)
+        (currentVideo as? VideoControls)?.updateProgressUi(progress)
     }
 
     fun pauseCurrentVideo() {
@@ -177,7 +188,7 @@ class VideoController private constructor(
         player.volume = 1f
         player.playWhenReady = true
         player.play()
-        video.setPausedUiVisible(false)
+        (video as? VideoControls)?.setPausedUiVisible(false)
         updateCurrentProgressUi()
     }
 
@@ -200,8 +211,8 @@ class VideoController private constructor(
         // 此时取到的就是刚截下的最新帧，占位封面与即将续播的首帧一致，切换最无缝。
         saveCurrentVideoPositionAndCover()
         val targetCover = coverFor(targetVideoItem)
-        currentVideo?.resetControlUi()
-        targetVideo.resetControlUi()
+        (currentVideo as? VideoControls)?.resetControlUi()
+        (targetVideo as? VideoControls)?.resetControlUi()
         isManuallyPaused = false
 
         // 1) 离开旧页：摘下播放器，立刻盖回静帧封面填补空窗。
@@ -282,10 +293,11 @@ class VideoController private constructor(
 
     private fun updateCurrentProgressUi() {
         val player = sharedPlayer ?: return
-        val video = currentVideo ?: return
-        if (video.isDraggingProgress) return
+        // 只有普通视频页才有进度条；直播页 currentVideo 不是 VideoControls，直接跳过。
+        val controls = currentVideo as? VideoControls ?: return
+        if (controls.isDraggingProgress) return
 
-        video.updateProgressUi(playerProgress(player))
+        controls.updateProgressUi(playerProgress(player))
     }
 
     private fun playerProgress(player: ExoPlayer): Float {
