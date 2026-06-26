@@ -43,6 +43,9 @@ class ChannelPager(
         }
     }
 
+    // 当前可见频道正在播放的那条视频；供 Activity.onStop 做"按归属暂停"。
+    fun currentVideo(): PlayableVideo? = channelAdapter.boundHolders[pager.currentItem]?.currentVideo()
+
     fun release() {
         channelAdapter.boundHolders.values.forEach { it.releasePage() }
         // adapter（inner 类，持有外层 ChannelPager 引用）随 adapter = null 失去引用，
@@ -96,6 +99,8 @@ class ChannelPager(
         fun playCurrentVideo() {
             videoPager?.playCurrentVideo()
         }
+
+        fun currentVideo(): PlayableVideo? = videoPager?.currentVideo()
 
         fun bind(channel: Channel, position: Int) {
             releasePage()

@@ -1,11 +1,7 @@
 package com.example.diceroller
 
-import android.content.ContentResolver
 import android.content.Context
-import android.content.res.Resources
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.view.TextureView
@@ -16,26 +12,28 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 
 // 所有视频页（普通视频页 + 直播页）的共同能力：承载共享播放器 + 封面占位。
-// 进度条/暂停这类只有普通视频才有的控件不放这里，见 VideoControls。
-interface VideoInterface {
+// 进度条/暂停这类只有普通视频才有的控件不放这里，见 InteractiveVideo。
+interface PlayableVideo {
     val videoItem: VideoItem?
-    val videoResId: Int?
-        get() = videoItem?.videoResId
+    // 网络化后用 videoUrl 作为每条视频的稳定标识（进度/封面缓存的 key）。
+    val videoKey: String?
+        get() = videoItem?.videoUrl
     val playerView: PlayerView
 
-    fun setCover(bitmap: Bitmap?, showCover: Boolean)
+    // 显示封面层：传入截帧位图则显示截帧；为 null 则露出网络首图（poster）。
+    fun setCover(bitmap: Bitmap?)
     fun hideCover()
     fun clearCover()
 
-    // 视图层自清理：清掉封面位图引用（普通视频页会扩展它再复位控件，见 VideoControls）。
+    // 视图层自清理：清掉封面位图引用（普通视频页会扩展它再复位控件，见 InteractiveVideo）。
     fun recycleUi() {
         clearCover()
     }
 }
 
 // 普通视频页特有：进度条 + 暂停控件。直播页没有这些，故单独拆出，
-// 避免直播 holder 被迫写一堆空实现。VideoController 用 as? VideoControls 按需调用。
-interface VideoControls : VideoInterface {
+// 避免直播 holder 被迫写一堆空实现。VideoController 用 as? InteractiveVideo 按需调用。
+interface InteractiveVideo : PlayableVideo {
     val isDraggingProgress: Boolean
     fun setPausedUiVisible(visible: Boolean)
     fun updateProgressUi(progress: Float)
@@ -54,12 +52,15 @@ class VideoController private constructor(
 
     private val appContext = context.applicationContext
     private val positionStore = PlaybackPositionStore()
-    private val coverStore = VideoCoverStore(appContext.resources)
+    private val coverStore = VideoCoverStore()
     private val progressTicker = RepeatingTicker(PROGRESS_UPDATE_INTERVAL_MS) { updateCurrentProgressUi() }
 
     private var sharedPlayer: ExoPlayer? = null
-    private var currentVideo: VideoInterface? = null
+    private var currentVideo: PlayableVideo? = null
     private var isManuallyPaused = false
+    // 当前视频是否已渲染出首帧。没渲染过就去截帧只会截到黑屏，
+    // 会把网络首图 poster 覆盖成黑色，所以存档封面前必须先确认这个为 true。
+    private var currentFrameRendered = false
 
     // 当前视频自然播放结束时回调（由活跃 pager 设置为"滑到下一条"），见 createSharedPlayer。
     var onVideoCompleted: (() -> Unit)? = null
@@ -68,7 +69,7 @@ class VideoController private constructor(
     // 由 pager / fragment 调用：播放、交互、生命周期、查询。
 
     // 由活跃 pager 在自己的 post 里把当前页视频传进来；为空（如 holder 尚未绑定）则忽略。
-    fun play(targetVideo: VideoInterface?) {
+    fun play(targetVideo: PlayableVideo?) {
         targetVideo ?: return
         val player = sharedPlayer ?: createSharedPlayer()
 
@@ -83,7 +84,7 @@ class VideoController private constructor(
         startPlayback(player, targetVideo)
     }
 
-    fun toggleVideo(video: VideoInterface) {
+    fun toggleVideo(video: PlayableVideo) {
         if (video !== currentVideo) return
 
         val player = sharedPlayer ?: return
@@ -95,7 +96,7 @@ class VideoController private constructor(
             isManuallyPaused = true
             pauseSharedPlayer()
             updateCurrentProgressUi()
-            (video as? VideoControls)?.setPausedUiVisible(true)
+            (video as? InteractiveVideo)?.setPausedUiVisible(true)
         }
     }
 
@@ -106,10 +107,16 @@ class VideoController private constructor(
 
         val targetPosition = (duration * progress.coerceIn(0f, 1f)).toLong()
         player.seekTo(targetPosition)
-        (currentVideo as? VideoControls)?.updateProgressUi(progress)
+        (currentVideo as? InteractiveVideo)?.updateProgressUi(progress)
     }
 
-    fun pauseCurrentVideo() {
+    // 暂停"指定页"——仅当它确实是当前挂着播放器的那页时才生效。
+    // 关键：Activity 间切换（首页 ↔ 直播间）时，旧页的 onStop 可能晚于新页的起播执行，
+    // 若无条件暂停会把新页刚开始的播放掐掉（表现为进/出直播间卡在封面、要滑动才恢复）。
+    // 用"目标必须等于 currentVideo"做归属判断：新页一旦接管，旧页的暂停请求自动失效；
+    // 真正退到后台时传入的还是当前页，照常暂停。
+    fun pauseVideo(video: PlayableVideo?) {
+        if (video == null || video !== currentVideo) return
         saveCurrentVideoPositionAndCover()
         pauseSharedPlayer()
     }
@@ -117,7 +124,7 @@ class VideoController private constructor(
     // 只在播放器确实挂在这一页时才解绑。守卫保证了作用域：
     // 分页器拆页/回收时逐页调用，唯有正在播放的那一页会真正摘下播放器，
     // 不会误伤当前正在别的频道播放的视频。只处理播放器状态，视图 UI 由调用方 recycleUi 负责。
-    fun detachFrom(video: VideoInterface) {
+    fun detachFrom(video: PlayableVideo) {
         if (currentVideo !== video) return
 
         saveCurrentVideoPositionAndCover()
@@ -137,7 +144,7 @@ class VideoController private constructor(
     }
 
     fun coverFor(videoItem: VideoItem): Bitmap? {
-        return coverStore.coverFor(videoItem.videoResId, videoItem.coverResId)
+        return coverStore.coverFor(videoItem.videoUrl)
     }
 
     fun currentVideoProgress(): Float {
@@ -159,6 +166,7 @@ class VideoController private constructor(
                 // 首帧渲染到 Surface 后撤掉切换时盖的占位封面。只动 currentVideo 的封面，
                 // 且 hideCover 幂等：seek 等会重复触发本回调，再调一次也只是无害空操作。
                 override fun onRenderedFirstFrame() {
+                    currentFrameRendered = true
                     currentVideo?.let { hideCoverAfterFramePainted(it) }
                 }
 
@@ -183,12 +191,12 @@ class VideoController private constructor(
     }
 
     // 开始/恢复播放的统一动作，play() 末尾和 toggleVideo 的恢复分支共用。
-    private fun startPlayback(player: ExoPlayer, video: VideoInterface) {
+    private fun startPlayback(player: ExoPlayer, video: PlayableVideo) {
         isManuallyPaused = false
         player.volume = 1f
         player.playWhenReady = true
         player.play()
-        (video as? VideoControls)?.setPausedUiVisible(false)
+        (video as? InteractiveVideo)?.setPausedUiVisible(false)
         updateCurrentProgressUi()
     }
 
@@ -203,16 +211,16 @@ class VideoController private constructor(
     // ===================== 切换：搬运播放器 + 换源 =====================
 
     // 把共享播放器从旧页搬到新页并换上新视频，一次切换的全部副作用都收在这里。
-    private fun switchToVideo(player: ExoPlayer, targetVideo: VideoInterface) {
+    private fun switchToVideo(player: ExoPlayer, targetVideo: PlayableVideo) {
         val targetVideoItem = targetVideo.videoItem ?: return
-        val targetVideoResId = targetVideoItem.videoResId
+        val targetVideoUrl = targetVideoItem.videoUrl
 
         // 先存档旧页（含截下它当前帧存为封面），再取新页封面：若新旧恰是同一条视频，
         // 此时取到的就是刚截下的最新帧，占位封面与即将续播的首帧一致，切换最无缝。
         saveCurrentVideoPositionAndCover()
         val targetCover = coverFor(targetVideoItem)
-        (currentVideo as? VideoControls)?.resetControlUi()
-        (targetVideo as? VideoControls)?.resetControlUi()
+        (currentVideo as? InteractiveVideo)?.resetControlUi()
+        (targetVideo as? InteractiveVideo)?.resetControlUi()
         isManuallyPaused = false
 
         // 1) 离开旧页：摘下播放器，立刻盖回静帧封面填补空窗。
@@ -222,40 +230,35 @@ class VideoController private constructor(
             coverDetachedPage(oldVideo)
         }
         currentVideo = targetVideo
+        currentFrameRendered = false
 
         // 2) 把新视频装进共享播放器：停掉旧内容，定位到上次进度，预备。
         pauseSharedPlayer()
-        player.setMediaItem(mediaItemFor(targetVideoResId), positionStore.positionFor(targetVideoResId))
+        player.setMediaItem(mediaItemFor(targetVideoUrl), positionStore.positionFor(targetVideoUrl))
         player.prepare()
 
         // 3) 先盖占位封面再挂播放器（封面在上，等首帧真正上屏再撤，见 onRenderedFirstFrame）。
-        targetVideo.setCover(bitmap = targetCover, showCover = targetCover != null)
+        targetVideo.setCover(targetCover)
         targetVideo.playerView.player = player
     }
 
-    private fun mediaItemFor(videoResId: Int): MediaItem {
-        val uri = Uri.Builder()
-            .scheme(ContentResolver.SCHEME_ANDROID_RESOURCE)
-            .path(videoResId.toString())
-            .build()
-        return MediaItem.fromUri(uri)
+    private fun mediaItemFor(videoUrl: String): MediaItem {
+        return MediaItem.fromUri(videoUrl)
     }
 
     // ============================ 封面占位 ============================
 
     // 给一页盖上静帧占位封面，用于它刚被摘掉播放器、画面会变空的时刻。
-    private fun coverDetachedPage(video: VideoInterface) {
+    private fun coverDetachedPage(video: PlayableVideo) {
         val videoItem = video.videoItem ?: return
-        val cover = coverFor(videoItem)
-
-        video.setCover(bitmap = cover, showCover = cover != null)
+        video.setCover(coverFor(videoItem))
     }
 
     // onRenderedFirstFrame 只表示帧已渲染进 SurfaceTexture，TextureView 还要等下一帧
     // VSYNC 才真正合成上屏。冷启动首个视频这个间隙最明显，此刻立刻撤封面会先露出深色
     // 背景（看起来像短暂黑屏）。推迟一帧再撤，确保画面已经上屏；并校验仍是当前视频，
     // 避免极短时间内被切走后误撤到别的页的封面。
-    private fun hideCoverAfterFramePainted(video: VideoInterface) {
+    private fun hideCoverAfterFramePainted(video: PlayableVideo) {
         video.playerView.postOnAnimation {
             if (currentVideo === video) {
                 video.hideCover()
@@ -267,13 +270,16 @@ class VideoController private constructor(
 
     private fun saveCurrentVideoPositionAndCover() {
         val video = currentVideo ?: return
-        val videoResId = video.videoResId ?: return
+        val videoKey = video.videoKey ?: return
         val player = sharedPlayer ?: return
-        positionStore.savePosition(videoResId, player.currentPosition)
+        positionStore.savePosition(videoKey, player.currentPosition)
+
+        // 没渲染出首帧时截到的是黑屏，存了会盖掉网络首图 poster，所以只在已渲染时存截帧封面。
+        if (!currentFrameRendered) return
 
         val renderedCover = captureCurrentFrame(video.playerView)
         if (renderedCover != null) {
-            coverStore.saveRenderedCover(videoResId, renderedCover)
+            coverStore.saveRenderedCover(videoKey, renderedCover)
         }
     }
 
@@ -293,8 +299,8 @@ class VideoController private constructor(
 
     private fun updateCurrentProgressUi() {
         val player = sharedPlayer ?: return
-        // 只有普通视频页才有进度条；直播页 currentVideo 不是 VideoControls，直接跳过。
-        val controls = currentVideo as? VideoControls ?: return
+        // 只有普通视频页才有进度条；直播页 currentVideo 不是 InteractiveVideo，直接跳过。
+        val controls = currentVideo as? InteractiveVideo ?: return
         if (controls.isDraggingProgress) return
 
         controls.updateProgressUi(playerProgress(player))
@@ -322,51 +328,33 @@ class VideoController private constructor(
     }
 }
 
-private class VideoCoverStore(
-    private val resources: Resources
-) {
+// 这一版只保留"实时截帧封面"：看过的视频在切走/回看时显示上次的画面，切换无缝。
+// 还没看过的视频没有截帧，coverFor 返回 null，页面先露黑底，等首帧上屏即可
+// （网络封面图/预置封面留待后续接 Fresco 再做）。封面按 videoUrl 缓存。
+private class VideoCoverStore {
 
-    private val renderedCovers = mutableMapOf<Int, Bitmap>()
-    private val packagedCovers = mutableMapOf<Int, Bitmap>()
+    private val renderedCovers = mutableMapOf<String, Bitmap>()
 
-    // 优先用实时截帧封面（看过的视频显示上次画面），否则回退到预置封面（占位图）。
-    fun coverFor(videoResId: Int, coverResId: Int): Bitmap? {
-        renderedCoverFor(videoResId)?.let { return it }
+    fun coverFor(videoUrl: String): Bitmap? = renderedCovers[videoUrl]
 
-        return packagedCoverFor(coverResId)
-    }
-
-    fun saveRenderedCover(videoResId: Int, renderedCover: Bitmap) {
+    fun saveRenderedCover(videoUrl: String, renderedCover: Bitmap) {
         // 不手动 recycle 旧封面：它可能仍被某个停靠页的 coverImageView 引用，
         // 回收后再绘制会 "trying to use a recycled bitmap" 崩溃。交给 GC 即可。
-        renderedCovers[videoResId] = renderedCover
-    }
-
-    private fun renderedCoverFor(videoResId: Int): Bitmap? {
-        return renderedCovers[videoResId]
-    }
-
-    private fun packagedCoverFor(coverResId: Int): Bitmap? {
-        packagedCovers[coverResId]?.let { return it }
-
-        val cover = BitmapFactory.decodeResource(resources, coverResId) ?: return null
-        packagedCovers[coverResId] = cover
-
-        return cover
+        renderedCovers[videoUrl] = renderedCover
     }
 }
 
-// 按 videoResId 记住每条视频的播放进度，切换/恢复时复位到上次位置。
+// 按 videoUrl 记住每条视频的播放进度，切换/恢复时复位到上次位置。
 private class PlaybackPositionStore {
 
-    private val positionsByVideoResId = mutableMapOf<Int, Long>()
+    private val positionsByVideoUrl = mutableMapOf<String, Long>()
 
-    fun positionFor(videoResId: Int): Long {
-        return positionsByVideoResId[videoResId] ?: 0L
+    fun positionFor(videoUrl: String): Long {
+        return positionsByVideoUrl[videoUrl] ?: 0L
     }
 
-    fun savePosition(videoResId: Int, positionMs: Long) {
-        positionsByVideoResId[videoResId] = positionMs
+    fun savePosition(videoUrl: String, positionMs: Long) {
+        positionsByVideoUrl[videoUrl] = positionMs
     }
 }
 

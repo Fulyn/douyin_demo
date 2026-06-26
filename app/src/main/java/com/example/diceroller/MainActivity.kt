@@ -19,28 +19,44 @@ import android.content.Intent
 import android.os.Bundle
 import android.view.View
 import android.view.ViewGroup
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.media3.common.util.UnstableApi
 import androidx.viewpager2.widget.ViewPager2
+import com.facebook.drawee.backends.pipeline.Fresco
 
 /**
  * 抖音风首页：横向频道 + 每个频道的竖向视频流。直接由 Activity 承载，不再套 Fragment。
  * 进入直播间用启动 LiveRoomActivity 实现（见 [openLiveRoom]）。
+ *
+ * 频道数据这一版改为网络拉取：onCreate 里向 [FeedRepository] 请求 videos.json，
+ * 拿到结果（主线程回调）后才搭建 pager，所以 channelPager 在加载完成前可能为 null。
  */
 @UnstableApi
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var channelPager: ChannelPager
-    private lateinit var channelBar: ChannelBar
+    private var channelPager: ChannelPager? = null
+    private var channelBar: ChannelBar? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 进程里第一个 Activity，且早于任何 SimpleDraweeView 被 inflate，在此初始化 Fresco 一次即可。
+        Fresco.initialize(applicationContext)
         VideoController.init(this)
         setContentView(R.layout.activity_main)
 
-        val channels = DemoVideoData.createChannels(this)
-        val initialChannelIndex = channels.lastIndex
+        FeedRepository.loadChannels(
+            onSuccess = { channels -> setupChannels(channels) },
+            onError = { error ->
+                Toast.makeText(this, "加载失败：${error.message}", Toast.LENGTH_LONG).show()
+            }
+        )
+    }
 
+    private fun setupChannels(channels: List<Channel>) {
+        if (channels.isEmpty()) return
+
+        val initialChannelIndex = channels.lastIndex
         val homeRoot = findViewById<View>(R.id.home_root)
         val channelPagerView = findViewById<ViewPager2>(R.id.channelPager)
         channelBar = ChannelBar(
@@ -53,24 +69,27 @@ class MainActivity : AppCompatActivity() {
             pager = channelPagerView,
             channels = channels,
             selectedIndex = initialChannelIndex,
-            channelBar = channelBar,
+            channelBar = channelBar!!,
             onEnterLiveRoom = { startPosition -> openLiveRoom(startPosition) }
         )
-        // 起播统一放在 onStart：首次创建时它必然紧跟 onCreate 触发，还能覆盖从后台/直播间返回的恢复。
+        // 数据可能在 onStart 之后才到达，这里补一次起播（onStart 当时还没有 pager 可播）。
+        channelPager?.playCurrentVideo()
     }
 
     override fun onStart() {
         super.onStart()
-        channelPager.playCurrentVideo()
+        channelPager?.playCurrentVideo()
     }
 
     override fun onStop() {
-        VideoController.shared.pauseCurrentVideo()
+        // 只暂停"本页正在播的那条"。若此刻直播间已接管播放器，这次请求会自动失效，
+        // 不会掐断直播间刚开始的播放。
+        VideoController.shared.pauseVideo(channelPager?.currentVideo())
         super.onStop()
     }
 
     override fun onDestroy() {
-        channelPager.release()
+        channelPager?.release()
         // 仅在真正结束（退出 App）时释放共享播放器；配置变更/被系统回收时保活单例，
         // 以免把播放器从前台的 LiveRoomActivity 脚下抽走。
         if (isFinishing) VideoController.shared.destroy()
@@ -111,7 +130,13 @@ class LiveRoomActivity : AppCompatActivity() {
         }
         setContentView(pagerView)
 
-        val liveChannel = DemoVideoData.createLiveChannel(this)
+        // 直播频道复用 MainActivity 拉取并缓存的那份数据；理论上进入按钮只在加载完成后才可见，
+        // 故缓存必然已就绪。万一为空（异常情况）则直接结束，避免空指针。
+        val liveChannel = FeedRepository.liveChannel()
+        if (liveChannel == null) {
+            finish()
+            return
+        }
         videoPager = VideoPager(
             pager = pagerView,
             channel = liveChannel,
@@ -124,16 +149,17 @@ class LiveRoomActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
-        videoPager.playCurrentVideo()
+        if (::videoPager.isInitialized) videoPager.playCurrentVideo()
     }
 
     override fun onStop() {
-        VideoController.shared.pauseCurrentVideo()
+        // 同理：只暂停直播间自己这条；返回首页时若首页已接管，这次请求自动失效。
+        VideoController.shared.pauseVideo(if (::videoPager.isInitialized) videoPager.currentVideo() else null)
         super.onStop()
     }
 
     override fun onDestroy() {
-        videoPager.release()
+        if (::videoPager.isInitialized) videoPager.release()
         super.onDestroy()
     }
 }

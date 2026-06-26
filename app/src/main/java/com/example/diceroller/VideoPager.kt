@@ -11,6 +11,7 @@ import android.widget.ImageView
 import android.widget.TextView
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.PlayerView
+import com.facebook.drawee.view.SimpleDraweeView
 import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.widget.ViewPager2
 
@@ -44,7 +45,7 @@ class VideoPager(
         pager.registerOnPageChangeCallback(videoChangeCallback)
     }
 
-    fun currentVideo(): VideoInterface? = videoAdapter.boundHolders[pager.currentItem]
+    fun currentVideo(): PlayableVideo? = videoAdapter.boundHolders[pager.currentItem]
 
     // 播放本竖向 pager 的当前视频，并把"播完平滑滑到下一条"绑定到自己身上
     // （循环页足够多，currentItem + 1 始终有效）。
@@ -67,7 +68,7 @@ class VideoPager(
     // 普通频道用 VideoViewHolder（含进度/暂停控件），直播频道用 LiveViewHolder（含进入按钮）。
     private inner class VideoPagerAdapter : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
 
-        val boundHolders = mutableMapOf<Int, VideoInterface>()
+        val boundHolders = mutableMapOf<Int, PlayableVideo>()
 
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
             return if (channel.isLiveChannel) {
@@ -79,7 +80,7 @@ class VideoPager(
 
         override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
             boundHolders.entries.removeAll { it.value === holder }
-            boundHolders[position] = holder as VideoInterface
+            boundHolders[position] = holder as PlayableVideo
 
             val realIndex = position % channel.videoItems.size
             val item = channel.videoItems[realIndex]
@@ -94,7 +95,7 @@ class VideoPager(
         }
 
         override fun onViewRecycled(holder: RecyclerView.ViewHolder) {
-            val video = holder as VideoInterface
+            val video = holder as PlayableVideo
             val position = boundHolders.entries.find { it.value === video }?.key ?: return
             boundHolders.remove(position)
             VideoController.shared.detachFrom(video)
@@ -108,10 +109,11 @@ internal class VideoViewHolder(
     parent: ViewGroup
 ) : RecyclerView.ViewHolder(
     LayoutInflater.from(parent.context).inflate(R.layout.view_video_item, parent, false)
-), VideoControls {
+), InteractiveVideo {
 
     override val playerView: PlayerView = itemView.findViewById(R.id.video_player_view)
     private val coverImageView: ImageView = itemView.findViewById(R.id.video_cover)
+    private val coverPoster: SimpleDraweeView = itemView.findViewById(R.id.video_cover_poster)
     private val pauseIconView: ImageView = itemView.findViewById(R.id.video_pause_icon)
     private val progressFill: View = itemView.findViewById(R.id.video_progress_fill)
     private val progressTrack: FrameLayout = itemView.findViewById(R.id.video_progress_track)
@@ -148,7 +150,8 @@ internal class VideoViewHolder(
 
         // 被绑定的页一定不是当前播放页（当前页不会被回收重绑），所以直接摘掉播放器、盖上封面占位。
         playerView.player = null
-        setCover(cover, showCover = cover != null)
+        coverPoster.setImageURI(videoItem.coverUrl)
+        setCover(cover)
 
         titleText.text = videoItem.title
         metaText.text = itemView.context.getString(R.string.video_meta, videoItem.author, videoItem.stats)
@@ -156,18 +159,24 @@ internal class VideoViewHolder(
 
     // ---------------- 封面 ----------------
 
-    override fun setCover(bitmap: Bitmap?, showCover: Boolean) {
+    // 两层封面：有截帧就用截帧（盖在上层），否则露出底下的网络首图 poster。
+    override fun setCover(bitmap: Bitmap?) {
         coverImageView.setImageBitmap(bitmap)
-        coverImageView.visibility = if (showCover) View.VISIBLE else View.GONE
+        coverImageView.visibility = if (bitmap != null) View.VISIBLE else View.GONE
+        coverPoster.visibility = if (bitmap == null) View.VISIBLE else View.GONE
     }
 
-    // 仅隐藏、保留位图：seek/重渲染会反复触发，之后可能还要原图复现。
+    // 仅隐藏两层、保留位图：首帧上屏后撤封面，之后切走还要原图复现。
     override fun hideCover() {
         coverImageView.visibility = View.GONE
+        coverPoster.visibility = View.GONE
     }
 
-    // 回收时彻底清掉位图引用，等价于 setCover(null, 隐藏)。
-    override fun clearCover() = setCover(bitmap = null, showCover = false)
+    // 回收时彻底清掉截帧位图引用并隐藏封面层。
+    override fun clearCover() {
+        coverImageView.setImageBitmap(null)
+        hideCover()
+    }
 
     // ---------------- 暂停 / 进度控件 ----------------
 
@@ -277,7 +286,7 @@ internal class VideoViewHolder(
     }
 }
 
-// 直播频道的页：复用共享播放器与封面机制，但没有进度/暂停控件（故只实现 VideoInterface）。
+// 直播频道的页：复用共享播放器与封面机制，但没有进度/暂停控件（故只实现 PlayableVideo）。
 // isInsideLiveRoom 区分两套 UI：true=直播间内（纯视频）；false=直播间外（预览浮层：标题/简介/进入按钮）。
 @UnstableApi
 internal class LiveViewHolder(
@@ -286,10 +295,11 @@ internal class LiveViewHolder(
     private val onEnterLiveRoom: ((startPosition: Int) -> Unit)?
 ) : RecyclerView.ViewHolder(
     LayoutInflater.from(parent.context).inflate(R.layout.view_live_item, parent, false)
-), VideoInterface {
+), PlayableVideo {
 
     override val playerView: PlayerView = itemView.findViewById(R.id.video_player_view)
     private val coverImageView: ImageView = itemView.findViewById(R.id.live_cover)
+    private val coverPoster: SimpleDraweeView = itemView.findViewById(R.id.live_cover_poster)
     private val previewOverlay: View = itemView.findViewById(R.id.live_preview_overlay)
     private val titleText: TextView = itemView.findViewById(R.id.live_title)
     private val metaText: TextView = itemView.findViewById(R.id.live_meta)
@@ -313,22 +323,29 @@ internal class LiveViewHolder(
 
         // 被绑定的页一定不是当前播放页（当前页不会被回收重绑），所以直接摘掉播放器、盖上封面占位。
         playerView.player = null
-        setCover(cover, showCover = cover != null)
+        coverPoster.setImageURI(videoItem.coverUrl)
+        setCover(cover)
 
         titleText.text = videoItem.title
         metaText.text = itemView.context.getString(R.string.video_meta, videoItem.author, videoItem.stats)
     }
 
-    override fun setCover(bitmap: Bitmap?, showCover: Boolean) {
+    // 两层封面：有截帧就用截帧（盖在上层），否则露出底下的网络首图 poster。
+    override fun setCover(bitmap: Bitmap?) {
         coverImageView.setImageBitmap(bitmap)
-        coverImageView.visibility = if (showCover) View.VISIBLE else View.GONE
+        coverImageView.visibility = if (bitmap != null) View.VISIBLE else View.GONE
+        coverPoster.visibility = if (bitmap == null) View.VISIBLE else View.GONE
     }
 
     override fun hideCover() {
         coverImageView.visibility = View.GONE
+        coverPoster.visibility = View.GONE
     }
 
-    override fun clearCover() = setCover(bitmap = null, showCover = false)
+    override fun clearCover() {
+        coverImageView.setImageBitmap(null)
+        hideCover()
+    }
 }
 
 private const val PROGRESS_HIDE_DELAY_MS = 1_500L
